@@ -34,11 +34,29 @@ using namespace std;
 
 class BlobReader {
 public:
-    BlobReader(const string& filename) : f(filename, ios::in | ios::binary) {}
+    BlobReader(const std::string& filename) : f(filename, std::ios::in | std::ios::binary) {}
+
+    std::string readString() {
+        uint32_t length;
+        f.read(reinterpret_cast<char*>(&length), sizeof(length));
+
+        std::string result;
+        result.resize(length);
+        f.read((char *)result.data(), length);
+
+        return result;
+    }
 
     template <typename Type>
-    typename enable_if<is_standard_layout<Type>::value, BlobReader&>::type
+    typename std::enable_if<std::is_standard_layout<Type>::value, BlobReader&>::type
         operator >> (Type& Element) {
+        uint16_t size;
+        Read(&size, 1);
+        if (size != sizeof(Type)) {
+            printf("Tried to read element of size %d but got %d", (int)sizeof(Type), (int)size);
+            exit(-1);
+        }
+
         Read(&Element, 1);
         return *this;
     }
@@ -55,7 +73,7 @@ public:
     }
 
 private:
-    ifstream f;
+    std::ifstream f;
 };
 
 static const int NUM_CHANNELS = 1;
@@ -141,8 +159,25 @@ public:
 
     bool read(BlobReader& blob) {
         uint64_t numNodes;
-        uint64_t numSamples;
-        blob >> mPos.x() >> mPos.y() >> mPos.z() >> mSize.x() >> mSize.y() >> mSize.z() >> mMean >> numSamples >> numNodes;
+        float numSamples;
+        int maxDepth;
+
+        blob
+            >> (float&)mMean
+            >> (float&)numSamples
+            >> (uint64_t&)numNodes
+            >> (int&)maxDepth
+            >> (float&)auxiliary;
+        
+        float tmp1;
+        int tmp2;
+        blob >> (float&)tmp1;
+        blob >> (int&)tmp2;
+        for (int i = 0; i < 3; ++i)
+            blob >> (float&)tmp1;
+
+        cout << "hooray" << endl;
+        
         if (!blob.isValid()) {
             return false;
         }
@@ -152,8 +187,6 @@ public:
         if (!isfinite(mMean)) {
             cerr << "INVALID MEAN: " << mMean << endl;
         }
-
-        mPos += mSize / 2;
 
         mNodes.resize(numNodes);
         for (size_t i = 0; i < mNodes.size(); ++i) {
@@ -223,9 +256,12 @@ private:
 
     int depth() const { return mDepth; }
 
+public:
     Vector3f mPos;
     Vector3f mSize;
+    float auxiliary;
 
+private:
     vector<QuadTreeNode> mNodes;
     float mMean;
     size_t mNumSamples;
@@ -283,14 +319,59 @@ private:
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+        glPointSize(2.0f);
     }
 
     string mTextureName;
     GLuint mTextureId;
 };
 
+Vector2f dirToCanonical(const Vector3f& d) {
+    const float cosTheta = std::min(std::max(d.z(), -1.0f), 1.0f);
+    float phi = std::atan2(d.y(), d.x());
+    while (phi < 0)
+      phi += 2.0 * M_PI;
+
+    return {(cosTheta + 1) / 2, phi / (2 * M_PI)};
+}
+
+Vector3f canonicalToDir(float x, float y) {
+    const float cosTheta = 2 * x - 1;
+    const float phi = 2 * M_PI * y;
+
+    const float sinTheta = sqrt(1 - cosTheta * cosTheta);
+    float sinPhi = sin(phi);
+    float cosPhi = cos(phi);
+    
+    return {sinTheta * cosPhi, sinTheta * sinPhi, cosTheta};
+};
+
+class CustomImageView : public ImageView {
+public:
+    CustomImageView(Widget* parent, GLuint imageID) : ImageView(parent, imageID) {}
+
+    void setLookCallback(const std::function<void(const Vector3f&)>& callback) {
+        mLookCallback = callback;
+    }
+
+    bool mouseMotionEvent(const Vector2i &p, const Vector2i &rel, int button, int modifiers) override {
+        auto x = imageCoordinateAt(p.cast<float>());
+        auto y = imageSizeF();
+        auto v = canonicalToDir(x.x() / y.x(), 1.0f - (x.y() / y.y()));
+
+        if (mLookCallback) {
+            mLookCallback(v);
+        }
+
+        return true;
+    }
+
+    std::function<void(const Vector3f&)> mLookCallback;
+};
+
 struct STree {
-    array<ImageView*, NUM_CHANNELS> imageViews;
+    array<CustomImageView*, NUM_CHANNELS> imageViews;
     array<GLTexture, NUM_CHANNELS> textures;
     vector<shared_ptr<DTree>> dTrees;
 
@@ -382,11 +463,34 @@ public:
             "}"
         );
 
+        lineShader.init(
+            "line_shader",
+
+            /* Vertex shader */
+            "#version 330\n"
+            "uniform mat4 modelViewProj;\n"
+            "in vec3 position;\n"
+            "out vec3 fragColor;\n"
+            "void main() {\n"
+            "    gl_Position = modelViewProj * vec4(position, 1.0);\n"
+            "    fragColor = vec3(1.0, 1.0, 1.0);"
+            "}",
+
+            /* Fragment shader */
+            "#version 330\n"
+            "out vec4 color;\n"
+            "in vec3 fragColor;\n"
+            "void main() {\n"
+            "    color = vec4(fragColor, 1.0);\n"
+            "}"
+        );
+
         performLayout();
     }
 
     ~SDTreeVisualizer() {
         mShader.free();
+        lineShader.free();
     }
 
     size_t totalPoints() const {
@@ -395,6 +499,15 @@ public:
             totalPoints += sTree.dTrees.size();
         }
         return totalPoints;
+    }
+
+    void updateLineShader(const Vector3f& x, const Vector3f& dir) {
+        MatrixXf positions(3, 2);
+        positions.col(0) = x;
+        positions.col(1) = x + 3 * dir;
+
+        lineShader.bind();
+        lineShader.uploadAttrib("position", positions);
     }
 
     void updateShader() {
@@ -441,6 +554,7 @@ public:
         new Label(mImageContainer, filename.substr(last, filename.size() - last), "sans-bold");
 
         BlobReader reader(filename);
+        std::cout << reader.readString() << std::endl;
 
         Matrix4f camera;
         for (int i = 0; i < 4; ++i) {
@@ -461,20 +575,65 @@ public:
 
         sTree.dTrees.clear();
 
-        Vector3f min = Vector3f::Constant(numeric_limits<float>::infinity());
-        Vector3f max = Vector3f::Constant(-numeric_limits<float>::infinity());
+        /* read STree information */
+        size_t numNodes;
+        Vector3f min, max;
 
-        while (true) {
-			shared_ptr<DTree> dTree = shared_ptr<DTree>(new DTree());
-            if (!dTree->read(reader)) {
-                break;
+        reader
+            >> (size_t&)numNodes
+            >> (float&)min.x() >> (float&)min.y() >> (float&)min.z()
+            >> (float&)max.x() >> (float&)max.y() >> (float&)max.z();
+
+        struct STreeNode {
+            bool isLeaf;
+            shared_ptr<DTree> dTree;
+            int axis;
+            std::array<uint32_t, 2> children;
+
+            void read(BlobReader& blob) {
+                blob
+                    >> (bool&)isLeaf
+                    >> (int&)axis
+                    >> (uint32_t&)children[0]
+                    >> (uint32_t&)children[1]
+                ;
+                
+                if (isLeaf) {
+                    dTree = shared_ptr<DTree>(new DTree());
+                    dTree->read(blob);
+                }
             }
 
-            min = min.array().min(dTree->pos().array());
-            max = max.array().max(dTree->pos().array());
+            void traverse(Vector3f pos, Vector3f size, vector<STreeNode> &nodes, STree &sTree) {
+                if (isLeaf) {
+                    if (dTree->nSamples() < 100)
+                        return;
+                    
+                    dTree->mPos = pos + size / 2;
+                    dTree->mSize = size;
 
-            sTree.dTrees.emplace_back(move(dTree));
+                    sTree.dTrees.emplace_back(move(dTree));
+                } else {
+                    size[axis] /= 2;
+                    
+                    Vector3f pos2 = pos;
+                    pos2[axis] += size[axis];
+
+                    nodes[children[0]].traverse(pos , size, nodes, sTree);
+                    nodes[children[1]].traverse(pos2, size, nodes, sTree);
+                }
+            }
+        };
+
+        vector<STreeNode> nodes;
+        nodes.resize(numNodes);
+
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            auto& node = nodes[i];
+            node.read(reader);
         }
+
+        nodes[0].traverse(min, max - min, nodes, sTree);
 
         if (mSDTrees.size() == 1) {
             mAABBDiag = (max - min).norm();
@@ -490,11 +649,19 @@ public:
 
         size_t idx = mSDTrees.size() - 1;
         for (size_t i = 0; i < sTree.imageViews.size(); ++i) {
-            sTree.imageViews[i] = new ImageView(buffers, sTree.textures[i].texture(firstDTree, (int)i));
+            sTree.imageViews[i] = new CustomImageView(buffers, sTree.textures[i].texture(firstDTree, (int)i));
 
             sTree.imageViews[i]->setExposure(exposure());
             sTree.imageViews[i]->setGridThreshold(20);
             sTree.imageViews[i]->setPixelInfoThreshold(20);
+            sTree.imageViews[i]->setLookCallback(
+                [this, idx, i](const Vector3f& dir) -> void {
+                    const STree& sTree = mSDTrees[idx];
+                    auto& dTree = *sTree.dTrees[sTree.currentDTreeIndex];
+                    
+                    updateLineShader(dTree.mPos, dir);
+                }
+            );
             sTree.imageViews[i]->setPixelInfoCallback(
                 [this, idx, i](const Vector2i& index) -> pair<string, Color> {
                     const STree& sTree = mSDTrees[idx];
@@ -647,6 +814,9 @@ public:
         Vector2f relF = pixelToCanonical(rel);
         Vector3f side = mUp.cross(eye()).normalized();
 
+        if (modifiers == 2 && button == 1)
+            button = 4;
+
         bool isLeftHeld = (button & 1) != 0;
         if (isLeftHeld) {
             // Spin camera around target
@@ -785,10 +955,15 @@ public:
         mShader.bind();
         mShader.setUniform("modelViewProj", mvp());
         mShader.drawIndexed(GL_POINTS, 0, static_cast<uint32_t>(totalPoints()));
+        
+        lineShader.bind();
+        lineShader.setUniform("modelViewProj", mvp());
+        lineShader.drawArray(GL_LINES, 0, 2);
     }
 
 private:
     GLShader mShader;
+    GLShader lineShader;
 
     TextBox* mExposureTextbox;
     Slider* mExposureSlider;

@@ -3,6 +3,7 @@
 
     Copyright (c) 2007-2014 by Wenzel Jakob
     Copyright (c) 2017 by ETH Zurich, Thomas Mueller.
+    Copyright (c) 2020 by Alexander Rath.
 
     Mitsuba is free software; you can redistribute it and/or modify
     it under the terms of the GNU General Public License Version 3
@@ -16,6 +17,9 @@
     You should have received a copy of the GNU General Public License
     along with this program. If not, see <http://www.gnu.org/licenses/>.
 */
+
+// all additions for our paper "Variance-aware path guiding"
+// have been marked with "@addition" so they can easily be found using search
 
 #include <mitsuba/render/renderproc.h>
 #include <mitsuba/render/scene.h>
@@ -32,15 +36,67 @@
 
 MTS_NAMESPACE_BEGIN
 
+class BlobReader {
+public:
+    BlobReader(const std::string& filename) : f(filename, std::ios::in | std::ios::binary) {}
+
+    std::string readString() {
+        uint32_t length;
+        f.read(reinterpret_cast<char*>(&length), sizeof(length));
+
+        std::string result;
+        result.resize(length);
+        f.read((char *)result.data(), length);
+
+        return result;
+    }
+
+    template <typename Type>
+    typename std::enable_if<std::is_standard_layout<Type>::value, BlobReader&>::type
+    operator >> (Type& Element) {
+        uint16_t size;
+        Read(&size, 1);
+        if (size != sizeof(Type)) {
+            SLog(EError, "Tried to read element of size %d but got %d", (int)sizeof(Type), (int)size);
+        }
+
+        Read(&Element, 1);
+        return *this;
+    }
+
+    // CAUTION: This function may break down on big-endian architectures.
+    //          The ordering of bytes has to be reverted then.
+    template <typename T>
+    void Read(T* Dest, size_t Size) {
+        f.read(reinterpret_cast<char*>(Dest), Size * sizeof(T));
+    }
+
+    bool isValid() const {
+        return (bool)(f);
+    }
+
+private:
+    std::ifstream f;
+};
+
 class BlobWriter {
 public:
     BlobWriter(const std::string& filename)
         : f(filename, std::ios::out | std::ios::binary) {
     }
 
+    void writeString(const std::string& str) {
+        uint32_t length = str.length();
+        f.write(reinterpret_cast<const char*>(&length), sizeof(length));
+        f.write(str.c_str(), length);
+    }
+
     template <typename Type>
     typename std::enable_if<std::is_standard_layout<Type>::value, BlobWriter&>::type
         operator << (Type Element) {
+        uint16_t size = sizeof(Type);
+        Write(&size, 1);
+
         Write(&Element, 1);
         return *this;
     }
@@ -153,6 +209,18 @@ enum class ESpatialFilter {
 enum class EDirectionalFilter {
     ENearest,
     EBox,
+};
+
+enum class EDistribution {
+    ERadiance,
+    ESimple,
+    EFull
+};
+
+enum class EDIStrategy {
+    ENoDI,
+    EUnweightedDI,
+    EWeightedDI
 };
 
 class QuadTreeNode {
@@ -343,18 +411,24 @@ public:
 
     // Ensure that each quadtree node's sum of irradiance estimates
     // equals that of all its children.
-    void build(std::vector<QuadTreeNode>& nodes) {
+    void build(std::vector<QuadTreeNode>& nodes, EDistribution distribution, Float parentSize = 1.f) {
+        Float childSize = parentSize / 4.f;
+
         for (int i = 0; i < 4; ++i) {
-            // During sampling, all irradiance estimates are accumulated in
-            // the leaves, so the leaves are built by definition.
             if (isLeaf(i)) {
+                if (distribution == EDistribution::ESimple || distribution == EDistribution::EFull) {
+                    // @addition
+                    // our guiding distributions are based on the second moment and
+                    // therefore need a pointwise square-root operation
+                    setSum(i, std::sqrt(sum(i) * childSize));
+                }
                 continue;
             }
 
             QuadTreeNode& c = nodes[child(i)];
 
             // Recursively build each child such that their sum becomes valid...
-            c.build(nodes);
+            c.build(nodes, distribution, childSize);
 
             // ...then sum up the children's sums.
             Float sum = 0;
@@ -380,6 +454,10 @@ public:
         m_nodes.front().setSum(0.0f);
     }
 
+    QuadTreeNode& node(size_t i) {
+        return m_nodes[i];
+    }
+
     const QuadTreeNode& node(size_t i) const {
         return m_nodes[i];
     }
@@ -390,6 +468,11 @@ public:
         }
         const Float factor = 1 / (M_PI * 4 * m_atomic.statisticalWeight);
         return factor * m_atomic.sum;
+    }
+
+    void setMean(const Float& mean) {
+        const Float factor = M_PI * 4 * m_atomic.statisticalWeight;
+        m_atomic.sum.store(factor * mean, std::memory_order_relaxed);
     }
 
     void recordIrradiance(Point2 p, Float irradiance, Float statisticalWeight, EDirectionalFilter directionalFilter) {
@@ -439,6 +522,16 @@ public:
         res.y = math::clamp(res.y, 0.0f, 1.0f);
 
         return res;
+    }
+
+    void setNumNodes(size_t numNodes) {
+        m_nodes.resize(numNodes);
+    }
+
+    void resetSum() {
+        for (auto& node : m_nodes) {
+            node.setSum(0.f);
+        }
     }
 
     size_t numNodes() const {
@@ -517,11 +610,11 @@ public:
         return m_nodes.capacity() * sizeof(QuadTreeNode) + sizeof(*this);
     }
 
-    void build() {
+    void build(EDistribution distribution) {
         auto& root = m_nodes[0];
 
         // Build the quadtree recursively, starting from its root.
-        root.build(m_nodes);
+        root.build(m_nodes, distribution);
 
         // Ensure that the overall sum of irradiance estimates equals
         // the sum of irradiance estimates found in the quadtree.
@@ -556,6 +649,7 @@ private:
 
     } m_atomic;
 
+public:
     int m_maxDepth;
 };
 
@@ -607,8 +701,8 @@ public:
         return {(cosTheta + 1) / 2, phi / (2 * M_PI)};
     }
 
-    void build() {
-        building.build();
+    void build(EDistribution distribution) {
+        building.build(distribution);
         sampling = building;
     }
 
@@ -696,11 +790,69 @@ public:
         m_lock.unlock();
     }
 
-    void dump(BlobWriter& blob, const Point& p, const Vector& size) const {
+    void read(BlobReader& blob) {
+        float mean;
+        float statisticalWeight;
+        uint64_t numNodes;
+        int mCount;
+
+        float zero = 0;
+
         blob
-            << (float)p.x << (float)p.y << (float)p.z
-            << (float)size.x << (float)size.y << (float)size.z
-            << (float)sampling.mean() << (uint64_t)sampling.statisticalWeight() << (uint64_t)sampling.numNodes();
+            >> (float&)mean
+            >> (float&)statisticalWeight
+            >> (uint64_t&)numNodes
+            >> (int&)sampling.m_maxDepth
+            >> (float&)zero
+            >> (float&)zero
+            >> (int&)mCount
+        ;
+
+        Spectrum m;
+        for (int i = 0; i < SPECTRUM_SAMPLES; ++i)
+            blob >> (float&)m[i];
+
+        sampling.setNumNodes(numNodes);
+        sampling.setStatisticalWeight(statisticalWeight);
+        sampling.setMean(mean);
+        //sampling.setMeasurementCount(mCount);
+        //sampling.setMeasurement(m);
+        
+        for (size_t i = 0; i < sampling.numNodes(); ++i) {
+            auto& node = sampling.node(i);
+            for (int j = 0; j < 4; ++j) {
+                float mean;
+                uint16_t child;
+
+                blob >> (float&)mean;
+                mean = std::max(mean, 0.f);
+                //SAssert(mean >= 0.0f);
+
+                blob >> (uint16_t&)child;
+
+                node.setSum(j, mean);
+                node.setChild(j, child);
+            }
+        }
+
+        building = sampling;
+        building.resetSum();
+    }
+
+    void dump(BlobWriter& blob) const {
+        blob
+            << (float)sampling.mean()
+            << (float)sampling.statisticalWeight()
+            << (uint64_t)sampling.numNodes()
+            << (int)sampling.m_maxDepth
+            << (float)bsdfSamplingFractionOptimizer.variable()
+            << (float)0
+            << (int)0
+        ;
+
+        Spectrum m { 0.f };
+        for (int i = 0; i < SPECTRUM_SAMPLES; ++i)
+            blob << (float)m[i];
 
         for (size_t i = 0; i < sampling.numNodes(); ++i) {
             const auto& node = sampling.node(i);
@@ -838,6 +990,26 @@ struct STreeNode {
         }
     }
 
+    void read(BlobReader& blob) {
+        blob
+            >> (bool&)isLeaf
+            >> (int&)axis
+            >> (uint32_t&)children[0] >> (uint32_t&)children[1];
+        
+        if (isLeaf)
+            dTree.read(blob);
+    }
+
+    void dump(BlobWriter& blob) const {
+        blob
+            << (bool)isLeaf
+            << (int)axis
+            << (uint32_t)children[0] << (uint32_t)children[1];
+
+        if (isLeaf)
+            dTree.dump(blob);
+    }
+
     bool isLeaf;
     DTreeWrapper dTree;
     int axis;
@@ -942,12 +1114,32 @@ public:
         m_nodes[0].record(p - dTreeVoxelSize * 0.5f, p + dTreeVoxelSize * 0.5f, m_aabb.min, m_aabb.getExtents(), rec, directionalFilter, bsdfSamplingFractionLoss, m_nodes);
     }
 
+    void read(BlobReader& blob) {
+        size_t numNodes;
+
+        blob
+            >> (size_t&)numNodes
+            >> (float&)m_aabb.min.x >> (float&)m_aabb.min.y >> (float&)m_aabb.min.z
+            >> (float&)m_aabb.max.x >> (float&)m_aabb.max.y >> (float&)m_aabb.max.z;
+        
+        m_nodes.resize(numNodes);
+
+        for (size_t i = 0; i < m_nodes.size(); ++i) {
+            auto& node = m_nodes[i];
+            node.read(blob);
+        }
+    }
+
     void dump(BlobWriter& blob) const {
-        forEachDTreeWrapperConstP([&blob](const DTreeWrapper* dTree, const Point& p, const Vector& size) {
-            if (dTree->statisticalWeight() > 0) {
-                dTree->dump(blob, p, size);
-            }
-        });
+        blob
+            << (size_t)m_nodes.size()
+            << (float)m_aabb.min.x << (float)m_aabb.min.y << (float)m_aabb.min.z
+            << (float)m_aabb.max.x << (float)m_aabb.max.y << (float)m_aabb.max.z;
+
+        for (size_t i = 0; i < m_nodes.size(); ++i) {
+            auto& node = m_nodes[i];
+            node.dump(blob);
+        }
     }
 
     bool shallSplit(const STreeNode& node, int depth, size_t samplesRequired) {
@@ -1012,7 +1204,14 @@ static StatsCounter avgPathLength("Guided path tracer", "Average path length", E
 class GuidedPathTracer : public MonteCarloIntegrator {
 public:
     GuidedPathTracer(const Properties &props) : MonteCarloIntegrator(props) {
-        m_neeStr = props.getString("nee", "never");
+        for (const auto& name : props.getPropertyNames()) {
+            Log(EInfo, "'%s': '%s'", name.c_str(), props.getAsString(name).c_str());
+        }
+
+        if (!Thread::getThread()->getLogger()->readLog(m_configLog))
+            Log(EInfo, "could not retrieve log");
+        
+        m_neeStr = props.getString("nee", "always");
         if (m_neeStr == "never") {
             m_nee = ENever;
         } else if (m_neeStr == "kickstart") {
@@ -1023,7 +1222,7 @@ public:
             Assert(false);
         }
 
-        m_sampleCombinationStr = props.getString("sampleCombination", "automatic");
+        m_sampleCombinationStr = props.getString("sampleCombination", "discard");
         if (m_sampleCombinationStr == "discard") {
             m_sampleCombination = ESampleCombination::EDiscard;
         } else if (m_sampleCombinationStr == "automatic") {
@@ -1034,7 +1233,7 @@ public:
             Assert(false);
         }
 
-        m_spatialFilterStr = props.getString("spatialFilter", "nearest");
+        m_spatialFilterStr = props.getString("spatialFilter", "box");
         if (m_spatialFilterStr == "nearest") {
             m_spatialFilter = ESpatialFilter::ENearest;
         } else if (m_spatialFilterStr == "stochastic") {
@@ -1045,7 +1244,7 @@ public:
             Assert(false);
         }
 
-        m_directionalFilterStr = props.getString("directionalFilter", "nearest");
+        m_directionalFilterStr = props.getString("directionalFilter", "box");
         if (m_directionalFilterStr == "nearest") {
             m_directionalFilter = EDirectionalFilter::ENearest;
         } else if (m_directionalFilterStr == "box") {
@@ -1053,6 +1252,23 @@ public:
         } else {
             Assert(false);
         }
+
+        m_distributionStr = props.getString("distribution", "radiance");
+        if (m_distributionStr == "radiance") {
+            m_distribution = EDistribution::ERadiance;
+        } else if (m_distributionStr == "simple") {
+            m_distribution = EDistribution::ESimple;
+        } else if (m_distributionStr == "full") {
+            m_distribution = EDistribution::EFull;
+        } else {
+            Assert(false);
+        }
+
+        auto diStr = props.getString("diStrategy", "no");
+        if (diStr == "no"        ) m_diStrategy = EDIStrategy::ENoDI; else
+        if (diStr == "weighted"  ) m_diStrategy = EDIStrategy::EWeightedDI; else
+        if (diStr == "unweighted") m_diStrategy = EDIStrategy::EUnweightedDI; else
+        Assert(false);
 
         m_bsdfSamplingFractionLossStr = props.getString("bsdfSamplingFractionLoss", "none");
         if (m_bsdfSamplingFractionLossStr == "none") {
@@ -1066,10 +1282,10 @@ public:
         }
 
         m_sdTreeMaxMemory = props.getInteger("sdTreeMaxMemory", -1);
-        m_sTreeThreshold = props.getInteger("sTreeThreshold", 12000);
-        m_dTreeThreshold = props.getFloat("dTreeThreshold", 0.01f);
+        m_sTreeThreshold = props.getInteger("sTreeThreshold", 2000);
+        m_dTreeThreshold = props.getFloat("dTreeThreshold", 0.005f);
         m_bsdfSamplingFraction = props.getFloat("bsdfSamplingFraction", 0.5f);
-        m_sppPerPass = props.getInteger("sppPerPass", 4);
+        m_sppPerPass = props.getInteger("sppPerPass", 1);
 
         m_budgetStr = props.getString("budgetType", "seconds");
         if (m_budgetStr == "spp") {
@@ -1082,6 +1298,8 @@ public:
 
         m_budget = props.getFloat("budget", 300.0f);
         m_dumpSDTree = props.getBoolean("dumpSDTree", false);
+
+        m_trainingIterations = props.getInteger("trainingIterations", -1);
     }
 
     ref<BlockedRenderProcess> renderPass(Scene *scene,
@@ -1112,11 +1330,15 @@ public:
         m_sdTree->forEachDTreeWrapperParallel([this](DTreeWrapper* dTree) { dTree->reset(20, m_dTreeThreshold); });
     }
 
-    void buildSDTree() {
-        Log(EInfo, "Building distributions for sampling.");
+    void buildSDTree(bool doBuild = true) {
+        if (doBuild) {
+            Log(EInfo, "Building distributions for sampling.");
 
-        // Build distributions
-        m_sdTree->forEachDTreeWrapperParallel([](DTreeWrapper* dTree) { dTree->build(); });
+            // Build distributions
+            m_sdTree->forEachDTreeWrapperParallel([this](DTreeWrapper* dTree) {
+                dTree->build(m_distribution);
+            });
+        }
 
         // Gather statistics
         int maxDepth = 0;
@@ -1188,6 +1410,30 @@ public:
         m_isBuilt = true;
     }
 
+    bool restoreSDTree(Scene* scene) {
+        fs::path path = scene->getDestinationFile();
+        path = path.parent_path() / (path.leaf().string() + ".sdt");
+
+        BlobReader blob(path.string());
+        blob.readString();
+        if (!blob.isValid()) {
+            return false;
+        }
+
+        Matrix4x4 cameraMatrix;
+
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                blob >> (float&)cameraMatrix(i, j);
+            }
+        }
+
+        m_sdTree->read(blob);
+        buildSDTree(false);
+
+        return true;
+    }
+
     void dumpSDTree(Scene* scene, ref<Sensor> sensor) {
         std::ostringstream extension;
         extension << "-" << std::setfill('0') << std::setw(2) << m_iter << ".sdt";
@@ -1197,6 +1443,7 @@ public:
         auto cameraMatrix = sensor->getWorldTransform()->eval(0).getMatrix();
 
         BlobWriter blob(path.string());
+        blob.writeString(m_configLog);
 
         for (int i = 0; i < 4; ++i) {
             for (int j = 0; j < 4; ++j) {
@@ -1295,6 +1542,74 @@ public:
             m_images.push_back(image->clone());
         }
 
+        // @addition calculate ad-hoc pixel estimate using iterated box filters
+        // results can be slightly enhanced with a properly denoised pixel estimate,
+        // which is, however, orthogonal to our work
+        if (m_distribution == EDistribution::EFull && !m_isFinalIter) {
+            Vector2i size = image->getSize();
+            m_pixelEstimate = image->clone();
+            
+            int blackPixels = 0;
+            auto data = static_cast<Float *>(m_pixelEstimate->getData());
+            int fpp = int(m_pixelEstimate->getBytesPerPixel() / sizeof(Float)); // floats per pixel
+            for (int i = 0, j = size.x*size.y; i < j; ++i) {
+                int isBlack = true;
+                for (int chan = 0; chan < SPECTRUM_SAMPLES; ++chan)
+                    isBlack &= data[chan + i*fpp] == 0.f;
+                blackPixels += isBlack;
+            }
+
+            Float blackDensity = 1.f / (std::sqrt(1.f - blackPixels / Float(size.x*size.y)) + 1e-3);
+            
+            const int FILTER_WIDTH = std::max(std::min(int(3 * blackDensity), std::min(size.x, size.y)-1), 1);
+            const int FILTER_ITERATIONS = 3;
+            
+            //SLog(EInfo, "filter: %d x%d", FILTER_WIDTH, FILTER_ITERATIONS);
+
+            auto boxFilter = [=](Float *data, int stride, int n) {
+                assert(n > FILTER_WIDTH);
+
+                double avg = FILTER_WIDTH * data[0];
+                Float stack[FILTER_WIDTH];
+                for (int i = 0; i < FILTER_WIDTH; ++i) {
+                    stack[i] = data[0];
+                    avg += data[i * stride];
+                }
+
+                for (int i = 0; i < n; ++i) {
+                    avg += data[std::min(i + FILTER_WIDTH, n - 1) * stride];
+                    Float newVal = avg;
+                    avg -= stack[i % FILTER_WIDTH];
+
+                    stack[i % FILTER_WIDTH] = data[i * stride];
+                    data[i * stride] = newVal;
+                }
+            };
+            
+            for (int i = 0, j = size.x*size.y; i < j; ++i) {
+                Float &weight = data[SPECTRUM_SAMPLES+1 + i*fpp];
+                if (weight > 0.f)
+                    for (int chan = 0; chan < SPECTRUM_SAMPLES; ++chan)
+                        data[chan + i*fpp] /= weight;
+                weight = 1.f;
+            }
+
+            for (int chan = 0; chan < SPECTRUM_SAMPLES; ++chan) {
+                for (int iter = 0; iter < FILTER_ITERATIONS; ++iter) {
+                    for (int x = 0; x < size.x; ++x)
+                        boxFilter(data + chan + x*fpp, size.x*fpp, size.y);
+                    for (int y = 0; y < size.y; ++y)
+                        boxFilter(data + chan + y*size.x*fpp, fpp, size.x);
+                }
+                for (int i = 0, j = size.x * size.y; i < j; ++i) {
+                    Float norm = 1.f / std::pow(2 * FILTER_WIDTH + 1, 2*FILTER_ITERATIONS);
+                    data[chan + i*fpp] *= norm;
+                    // apply offset to avoid numerical instabilities
+                    data[chan + i*fpp] += 1e-3;
+                }
+            }
+        }
+
         m_varianceBuffer->clear();
 
         int N = passesRenderedLocal * m_sppPerPass;
@@ -1355,6 +1670,24 @@ public:
         bool result = true;
         Float currentVarAtEnd = std::numeric_limits<Float>::infinity();
 
+        if (restoreSDTree(scene)) {
+            Log(EInfo, "RESTORED SD TREE");
+
+            Float variance;
+
+            film->clear();
+            m_isFinalIter = true;
+            m_doNee = doNeeWithSpp(256);
+
+            m_progress = std::unique_ptr<ProgressReporter>(new ProgressReporter("Rendering", m_budget, job));
+            m_sppPerPass = 1;
+            if (!performRenderPasses(variance, m_budget, scene, queue, job, sceneResID, sensorResID, samplerResID, integratorResID)) {
+                return false;
+            }
+
+            return true;
+        }
+
         m_progress = std::unique_ptr<ProgressReporter>(new ProgressReporter("Rendering", nPasses, job));
 
         while (result && m_passesRendered < nPasses) {
@@ -1369,9 +1702,9 @@ public:
             // the current iteration to the end.
             // This condition can also be interpreted as: the last iteration must always use
             // at _least_ half the total sample budget.
-            if (remainingPasses - passesThisIteration < 2 * passesThisIteration) {
-                passesThisIteration = remainingPasses;
-            }
+            //if (remainingPasses - passesThisIteration < 2 * passesThisIteration) {
+            //    passesThisIteration = remainingPasses;
+            //}
 
             Log(EInfo, "ITERATION %d, %d passes", m_iter, passesThisIteration);
             
@@ -1438,7 +1771,7 @@ public:
         ref<Sensor> sensor = static_cast<Sensor *>(sched->getResource(sensorResID));
         ref<Film> film = sensor->getFilm();
 
-        Float nSeconds = m_budget;
+        const Float nSeconds = m_budget;
 
         bool result = true;
         Float currentVarAtEnd = std::numeric_limits<Float>::infinity();
@@ -1448,6 +1781,8 @@ public:
         Float elapsedSeconds = 0;
 
         while (result && elapsedSeconds < nSeconds) {
+            Float variance;
+
             const int sppRendered = m_passesRendered * m_sppPerPass;
             m_doNee = doNeeWithSpp(sppRendered);
 
@@ -1461,7 +1796,33 @@ public:
             film->clear();
             resetSDTree();
 
-            Float variance;
+            if (
+                (elapsedSeconds / Float(nSeconds) >= 0.15 && m_trainingIterations == -1)
+                || m_trainingIterations == m_iter
+            ) {
+                Log(EInfo, "FINAL %f seconds", remainingTime);
+                m_isFinalIter = true;
+
+                Float secsPerPass;
+                int passes = passesThisIteration;
+                
+                do {
+                    Float elapsedBefore = elapsedSeconds;
+
+                    if (!performRenderPasses(variance, passes, scene, queue, job, sceneResID, sensorResID, samplerResID, integratorResID)) {
+                        result = false;
+                        break;
+                    }
+
+                    elapsedSeconds = computeElapsedSeconds(m_startTime);
+                    secsPerPass = (elapsedSeconds - elapsedBefore) / passes;
+
+                    passes = std::max(1, std::min(128, int((nSeconds - elapsedSeconds) / secsPerPass)));
+                } while (elapsedSeconds < nSeconds);
+
+                break;
+            }
+
             if (!performRenderPasses(variance, passesThisIteration, scene, queue, job, sceneResID, sensorResID, samplerResID, integratorResID)) {
                 result = false;
                 break;
@@ -1479,26 +1840,7 @@ public:
                 lastVarAtEnd, currentVarAtEnd);
 
             remainingTime -= secondsIter;
-            if (m_sampleCombination == ESampleCombination::EDiscardWithAutomaticBudget && remainingTime > 0 && (
-                    // if there is any time remaining we want to keep going if
-                    // either will have less time next iter
-                    remainingTime < secondsIter ||
-                    // or, according to the convergence behavior, we're better off if we keep going
-                    // (we only trust the variance if we drew enough samples for it to be a reliable estimate,
-                    // captured by an arbitraty threshold).
-                    (sppRendered > 256 && currentVarAtEnd > lastVarAtEnd)
-                )) {
-                Log(EInfo, "FINAL %f seconds", remainingTime);
-                m_isFinalIter = true;
-                do {
-                    if (!performRenderPasses(variance, passesThisIteration, scene, queue, job, sceneResID, sensorResID, samplerResID, integratorResID)) {
-                        result = false;
-                        break;
-                    }
-
-                    elapsedSeconds = computeElapsedSeconds(m_startTime);
-                } while (elapsedSeconds < nSeconds);
-            }
+            elapsedSeconds = computeElapsedSeconds(m_startTime);
             buildSDTree();
 
             if (m_dumpSDTree) {
@@ -1507,7 +1849,6 @@ public:
 
             ++m_iter;
             m_passesRenderedThisIter = 0;
-            elapsedSeconds = computeElapsedSeconds(m_startTime);
         }
 
         return result;
@@ -1588,9 +1929,6 @@ public:
         Sampler *sampler, ImageBlock *block, const bool &stop,
         const std::vector< TPoint2<uint8_t> > &points) const {
 
-        Float diffScaleFactor = 1.0f /
-            std::sqrt((Float)m_sppPerPass);
-
         bool needsApertureSample = sensor->needsApertureSample();
         bool needsTimeSample = sensor->needsTimeSample();
 
@@ -1614,6 +1952,16 @@ public:
             Point2i offset = Point2i(points[i]) + Vector2i(block->getOffset());
             if (stop)
                 break;
+            
+            // @addition
+            // note that the pixel estimate is only needed for our full distribution
+            Spectrum pixelEstimate;
+            if (m_pixelEstimate.get()) {
+                pixelEstimate = m_pixelEstimate->getPixel(offset);
+            } else {
+                // if this is the first iteration, we assume that the image is uniformly 50% gray
+                pixelEstimate = Spectrum { 0.5f };
+            }
 
             for (int j = 0; j < m_sppPerPass; j++) {
                 rRec.newQuery(queryType, sensor->getMedium());
@@ -1624,12 +1972,11 @@ public:
                 if (needsTimeSample)
                     timeSample = rRec.nextSample1D();
 
-                Spectrum spec = sensor->sampleRayDifferential(
+                Spectrum spec = sensor->sampleRay(
                     sensorRay, samplePos, apertureSample, timeSample);
 
-                sensorRay.scaleDifferential(diffScaleFactor);
-
-                spec *= Li(sensorRay, rRec);
+                spec = Li(sensorRay, rRec, spec, pixelEstimate);
+                //if (m_isFinalIter) spec = pixelEstimate;
                 block->put(samplePos, spec, rRec.alpha);
                 squaredBlock->put(samplePos, spec * spec, rRec.alpha);
                 sampler->advance();
@@ -1710,6 +2057,15 @@ public:
     }
 
     Spectrum Li(const RayDifferential &r, RadianceQueryRecord &rRec) const {
+        NotImplementedError("Pixel estimate and throughput must be provided for full distribution");
+    }
+
+    Spectrum Li(
+        const RayDifferential &r,
+        RadianceQueryRecord &rRec,
+        Spectrum throughput,
+        const Spectrum &pixelEstimate
+    ) const {
         struct Vertex {
             DTreeWrapper* dTree;
             Vector dTreeVoxelSize;
@@ -1721,13 +2077,14 @@ public:
             Spectrum radiance;
 
             Float woPdf, bsdfPdf, dTreePdf;
+            Float woMisWeight;
             bool isDelta;
 
             void record(const Spectrum& r) {
                 radiance += r;
             }
 
-            void commit(STree& sdTree, Float statisticalWeight, ESpatialFilter spatialFilter, EDirectionalFilter directionalFilter, EBsdfSamplingFractionLoss bsdfSamplingFractionLoss, Sampler* sampler) {
+            void commit(STree& sdTree, Float statisticalWeight, ESpatialFilter spatialFilter, EDirectionalFilter directionalFilter, EBsdfSamplingFractionLoss bsdfSamplingFractionLoss, EDistribution distribution, Sampler* sampler, const Spectrum &pixelEstimate) {
                 if (!(woPdf > 0) || !radiance.isValid() || !bsdfVal.isValid()) {
                     return;
                 }
@@ -1736,9 +2093,59 @@ public:
                 if (throughput[0] * woPdf > Epsilon) localRadiance[0] = radiance[0] / throughput[0];
                 if (throughput[1] * woPdf > Epsilon) localRadiance[1] = radiance[1] / throughput[1];
                 if (throughput[2] * woPdf > Epsilon) localRadiance[2] = radiance[2] / throughput[2];
-                Spectrum product = localRadiance * bsdfVal;
 
-                DTreeRecord rec{ ray.d, localRadiance.average(), product.average(), woPdf, bsdfPdf, dTreePdf, statisticalWeight, isDelta };
+                // @addition
+                // target densities
+                Float value = 0;
+                switch (distribution) {
+                    case EDistribution::ERadiance:
+                        value = localRadiance.average();
+                        break;
+                    
+                    case EDistribution::ESimple:
+                        value = (bsdfVal * localRadiance).average(); // partial integrand
+                        if (woMisWeight > 0)
+                            // mis compensation
+                            value *= woMisWeight;
+                        value = std::pow(value, 2); // second moment
+                        break;
+                    
+                    case EDistribution::EFull:
+                        // note that since 'radiance = throughput * localRadiance',
+                        // we do not need a multiplication by throughput here.
+                        value = (radiance / pixelEstimate * woPdf).average(); // full integrand
+                        if (woMisWeight > 0)
+                            // mis compensation
+                            value *= woMisWeight;
+                        value = std::pow(value, 2); // second moment
+                        break;
+                    
+                    default:
+                        Assert(false);
+                }
+
+                // @addition
+                // selection probability
+                Float lossValue = 0;
+                switch (distribution) {
+                    case EDistribution::ERadiance:
+                        // previous selection probability loss (Müller et al.)
+                        lossValue = (localRadiance * bsdfVal).average();
+                        break;
+                    
+                    case EDistribution::ESimple:
+                    case EDistribution::EFull:
+                        // our selection probability loss
+                        // note that since 'radiance = throughput * localRadiance',
+                        // we do not need a multiplication by throughput here.
+                        lossValue = (radiance / pixelEstimate * woPdf).average(); // full integrand
+                        break;
+                    
+                    default:
+                        Assert(false);
+                }
+
+                DTreeRecord rec{ ray.d, value, lossValue, woPdf, bsdfPdf, dTreePdf, statisticalWeight, isDelta };
                 switch (spatialFilter) {
                     case ESpatialFilter::ENearest:
                         dTree->record(rec, directionalFilter, bsdfSamplingFractionLoss);
@@ -1783,7 +2190,6 @@ public:
         intersection has already been provided). */
         rRec.rayIntersect(ray);
 
-        Spectrum throughput(1.0f);
         bool scattered = false;
 
         int nVertices = 0;
@@ -1996,7 +2402,7 @@ public:
                             value *= bsdfVal;
                             Spectrum L = throughput * value * weight;
 
-                            if (!m_isFinalIter && m_nee != EAlways) {
+                            if (!m_isFinalIter && m_diStrategy != EDIStrategy::ENoDI) {
                                 if (dTree) {
                                     Vertex v = Vertex{
                                         dTree,
@@ -2004,14 +2410,17 @@ public:
                                         Ray(its.p, dRec.d, 0),
                                         throughput * bsdfVal / dRec.pdf,
                                         bsdfVal,
-                                        L,
+                                        m_diStrategy == EDIStrategy::EUnweightedDI ?
+                                            L :
+                                            L * miWeight(woPdf, dRec.pdf),
                                         dRec.pdf,
                                         bsdfPdf,
                                         dTreePdf,
+                                        dTreePdf / woPdf,
                                         false,
                                     };
 
-                                    v.commit(*m_sdTree, 0.5f, m_spatialFilter, m_directionalFilter, m_isBuilt ? m_bsdfSamplingFractionLoss : EBsdfSamplingFractionLoss::ENone, rRec.sampler);
+                                    v.commit(*m_sdTree, 1.0f, m_spatialFilter, m_directionalFilter, m_isBuilt ? m_bsdfSamplingFractionLoss : EBsdfSamplingFractionLoss::ENone, m_distribution, rRec.sampler, pixelEstimate);
                                 }
                             }
 
@@ -2060,6 +2469,7 @@ public:
                                 woPdf,
                                 bsdfPdf,
                                 dTreePdf,
+                                dTreePdf / woPdf,
                                 true,
                             };
 
@@ -2092,16 +2502,36 @@ public:
 
                     if ((!isDelta || m_bsdfSamplingFractionLoss != EBsdfSamplingFractionLoss::ENone) && dTree && nVertices < MAX_NUM_VERTICES && !m_isFinalIter) {
                         if (1 / woPdf > 0) {
+                            Spectrum Ldi { 0.f };
+                            if (m_doNee) {
+                                switch (m_diStrategy) {
+                                    case EDIStrategy::ENoDI:
+                                        Ldi = Spectrum { 0.f };
+                                        break;
+                                    case EDIStrategy::EWeightedDI:
+                                        Ldi = L * miWeight(woPdf, emitterPdf);
+                                        break;
+                                    case EDIStrategy::EUnweightedDI:
+                                        Ldi = L;
+                                        break;
+                                    default:
+                                        Assert(false);
+                                }
+                            } else {
+                                Ldi = L;
+                            }
+
                             vertices[nVertices] = Vertex{
                                 dTree,
                                 dTreeVoxelSize,
                                 ray,
                                 throughput,
                                 bsdfWeight * woPdf,
-                                (m_nee == EAlways) ? Spectrum{0.0f} : L,
+                                Ldi,
                                 woPdf,
                                 bsdfPdf,
                                 dTreePdf,
+                                dTreePdf / woPdf,
                                 isDelta,
                             };
 
@@ -2149,7 +2579,7 @@ public:
 
         if (nVertices > 0 && !m_isFinalIter) {
             for (int i = 0; i < nVertices; ++i) {
-                vertices[i].commit(*m_sdTree, m_nee == EKickstart && m_doNee ? 0.5f : 1.0f, m_spatialFilter, m_directionalFilter, m_isBuilt ? m_bsdfSamplingFractionLoss : EBsdfSamplingFractionLoss::ENone, rRec.sampler);
+                vertices[i].commit(*m_sdTree, 1.0f, m_spatialFilter, m_directionalFilter, m_isBuilt ? m_bsdfSamplingFractionLoss : EBsdfSamplingFractionLoss::ENone, m_distribution, rRec.sampler, pixelEstimate);
             }
         }
 
@@ -2269,6 +2699,7 @@ private:
     mutable ref<ImageBlock> m_image;
 
     std::vector<ref<Bitmap>> m_images;
+    ref<Bitmap> m_pixelEstimate;
     std::vector<Float> m_variances;
 
     /// This contains the currently estimated variance.
@@ -2309,6 +2740,8 @@ private:
     std::string m_budgetStr;
     EBudget m_budgetType;
     Float m_budget;
+
+    int m_trainingIterations;
 
     bool m_isBuilt = false;
     int m_iter;
@@ -2366,6 +2799,22 @@ private:
     EDirectionalFilter m_directionalFilter;
 
     /**
+        The guiding distribution that should be approximated.
+        The following values are valid:
+        - "radiance": Previous guiding distribution [Mueller et al. 2017].
+        - "simple":   Approximates parts of the integrand
+                      Robust for short renders, but worse than "full" for long renders
+        - "full":     Approximates the full integrand
+                      Recommended for very long renders, otherwise use "simple"
+        Default     = "radiance" (for reproducibility)
+        Recommended = "simple" for short renders
+    */
+    std::string m_distributionStr;
+    EDistribution m_distribution;
+
+    EDIStrategy m_diStrategy;
+
+    /**
         Leaf nodes of the spatial binary tree are subdivided if the number of samples
         they received in the last iteration exceeds c * sqrt(2^k) where c is this value
         and k is the iteration index. The first iteration has k==0.
@@ -2413,6 +2862,8 @@ private:
 
     /// The time at which rendering started.
     std::chrono::steady_clock::time_point m_startTime;
+
+    std::string m_configLog;
 
 public:
     MTS_DECLARE_CLASS()
