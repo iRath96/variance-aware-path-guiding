@@ -95,7 +95,7 @@
     </param>
   </plugin>
 
-	<plugin type="integrator" name="guided" readableName="Guided Path Tracer"
+	<plugin type="integrator" name="guided_path" readableName="Guided Path Tracer"
 		    show="true" className="GuidedPathTracer" extends="MonteCarloIntegrator">
 		<descr>
 			Implementation of the paper "Practical Path Guiding for Efficient Light-Transport Simulation" [Müller et al. 2017].
