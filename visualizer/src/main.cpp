@@ -176,8 +176,6 @@ public:
         for (int i = 0; i < 3; ++i)
             blob >> (float&)tmp1;
 
-        cout << "hooray" << endl;
-        
         if (!blob.isValid()) {
             return false;
         }
@@ -583,7 +581,7 @@ public:
             >> (size_t&)numNodes
             >> (float&)min.x() >> (float&)min.y() >> (float&)min.z()
             >> (float&)max.x() >> (float&)max.y() >> (float&)max.z();
-
+        
         struct STreeNode {
             bool isLeaf;
             shared_ptr<DTree> dTree;
