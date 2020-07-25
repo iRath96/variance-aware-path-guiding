@@ -604,8 +604,8 @@ public:
 
             void traverse(Vector3f pos, Vector3f size, vector<STreeNode> &nodes, STree &sTree) {
                 if (isLeaf) {
-                    if (dTree->nSamples() < 100)
-                        return;
+                    //if (dTree->nSamples() < 100)
+                    //    return;
                     
                     dTree->mPos = pos + size / 2;
                     dTree->mSize = size;
