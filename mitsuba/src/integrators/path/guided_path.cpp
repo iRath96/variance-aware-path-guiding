@@ -1566,11 +1566,11 @@ public:
             
             //SLog(EInfo, "filter: %d x%d", FILTER_WIDTH, FILTER_ITERATIONS);
 
+            Float *stack = new Float[FILTER_WIDTH];
             auto boxFilter = [=](Float *data, int stride, int n) {
                 assert(n > FILTER_WIDTH);
 
                 double avg = FILTER_WIDTH * data[0];
-                Float stack[FILTER_WIDTH];
                 for (int i = 0; i < FILTER_WIDTH; ++i) {
                     stack[i] = data[0];
                     avg += data[i * stride];
@@ -1608,6 +1608,8 @@ public:
                     data[chan + i*fpp] += 1e-3;
                 }
             }
+            
+            delete[] stack;
         }
 
         m_varianceBuffer->clear();
