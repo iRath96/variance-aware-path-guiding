@@ -158,7 +158,7 @@
 			"full":     Approximates the full integrand
 						Recommended for longer renders, otherwise use "simple"
 			Default     = "radiance" (for reproducibility)
-			Recommended = "simple"
+			Recommended = "full"
     </param>
 	<param name="diStrategy" readableName="DI strategy" type="string" default="no" importance="1">
       The strategy for direct illumination guiding.
